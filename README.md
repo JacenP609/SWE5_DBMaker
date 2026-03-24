@@ -27,7 +27,7 @@ StartupTask/OpenStartupTask
 
 다음과 같은 형식으로 Component/Unit 기준으로 해당 Function 의 Caller unit 위치가 정의 되어있다. 
 이 중 내 Target Function 의 Component 가 아닌 외부 component 에서 호출되는 첫번째 위치를 찾는다. 
- **만일 모든 Caller Unit 이 동일 Component 에서 수행된다면, 해당 Function Entry 는 추가 처리하지않고 결과물도 스킵하고 다음 entry 로 넘어가야함**
+ **만일 모든 Caller Unit 이 동일 Component 에서 수행된다면, 해당 Function Entry 는 추가 처리하지않고 결과물도 스킵하고 다음 entry 로 넘어가야함 (SWE.2 Work Item 의 Scope 자체가 아님) ** 
 
 해당 위치의 Component / Unit 명을 code_path_map.json 으로 탐색하여 caller Unit 의 위치를 찾는다. 
 또한, 해당 Component 에 해당하는 RAW_FOLDER 의 excel 파일을 열어 Entry 의 Interface ID 를 기반으로 Caller Unit 의 Function 으로 정의된 Entry 들의 interface ID 와 Function 명을 수집한다. 
@@ -48,3 +48,16 @@ Output : Caller Function Body 와 Caller Function Interface ID.
 """
 
 마지막으로 Linked Work Item 을 찾아줘야 한다. 이는 단순히 해당 Target Function 의 Function ID 를 찾아주는 것이다.**Interface ID 와 다름** 
+기존 로직을 참조해서, SWE2_WorkItem 엑셀이 있다고 가정하고 구현한다. 
+
+SCU 로직은 페기하고
+
+sources.json 을 활용하여 
+{
+  "PCQV8-44897": "HAL",
+  "PCQV8-39752": "Reference",
+  "PCQV8-40437": "Reference", 
+  ...
+}
+SWE.2 의 링크관계상 has parents : 의 정보로 component 를 가져오는 방식을 활용한다. 
+
