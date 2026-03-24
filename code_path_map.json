@@ -1,0 +1,13 @@
+{
+    "ExampleComponent": {
+        "ExampleUnit1": [
+            "C:\\am9c1\\Src\\HIL\\Path1\\Path2\\header1.h"
+        ],
+        "ExampleUnit2": [
+            "C:\\am9c1\\Src\\HIL\\Path1\\Path2\\header2.h"
+        ],
+        "ExampleUnit3": [
+            "C:\\am9c1\\Src\\HIL\\path2\\header3.h"
+        ]
+    }
+}
