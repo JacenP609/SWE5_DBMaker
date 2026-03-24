@@ -85,7 +85,7 @@ def filter_code_by_build_options(code: str) -> str:
             continue
 
         # 9) 실제 코드 출력: 현재 스택이 비어있거나 skip=False 일 때만
-        if not stack or not stack[-1]["skip"]:
+        if not any(level["skip"] for level in stack):
             output.append(line)
 
     return "\n".join(output)
