@@ -317,6 +317,38 @@ def expand_one_level(function_body: str, code_str: str, class_name: Optional[str
         full_body = extract_function_body(code_str, func_name, class_name)
         return extract_inner_body(full_body)
 
+    def infer_current_function_name() -> str:
+        header = function_body.split("{", 1)[0]
+        match = re.search(r"([A-Za-z_]\w*)\s*\(", header)
+        return match.group(1) if match else ""
+
+    current_function_name = infer_current_function_name()
+    normalized_class = re.sub(r"\s+", "", str(class_name or "").strip())
+
+    local_candidate_names = set()
+    for definition in iter_function_definitions(code_str):
+        if normalized_class:
+            if definition.qualified_name == f"{normalized_class}::{definition.name}":
+                local_candidate_names.add(definition.name)
+        else:
+            local_candidate_names.add(definition.name)
+
+    def is_expandable_name(func_name: str) -> bool:
+        if func_name in _BAD_PREFIX_HEADS:
+            return False
+        if current_function_name and func_name == current_function_name:
+            return False
+        if local_candidate_names and func_name not in local_candidate_names:
+            return False
+        return True
+
+    standalone_call = re.compile(
+        r"^(\s*)([A-Za-z_]\w*)\s*\((.*)\)\s*;\s*$"
+    )
+    inline_call = re.compile(
+        r"(?<![\w:.>])([A-Za-z_]\w*)\s*\(.*?\)"
+    )
+
     lines = function_body.splitlines()
     updated = []
     indent_unit = "    "
@@ -329,10 +361,13 @@ def expand_one_level(function_body: str, code_str: str, class_name: Optional[str
                 inside_body = True
             continue
 
-        standalone = re.match(r"^(\s*)(_\w+)\s*\((.*)\)\s*;\s*$", line)
+        standalone = standalone_call.match(line)
         if standalone:
             indent = standalone.group(1)
             private_name = standalone.group(2)
+            if not is_expandable_name(private_name):
+                updated.append(line)
+                continue
             body = extract_body_only(private_name)
             if body:
                 expanded = "\n".join(f"{indent}{indent_unit}{part}" for part in body.splitlines())
@@ -343,6 +378,8 @@ def expand_one_level(function_body: str, code_str: str, class_name: Optional[str
 
         def inline_replace(match: re.Match[str]) -> str:
             private_name = match.group(1)
+            if not is_expandable_name(private_name):
+                return match.group(0)
             body = extract_body_only(private_name)
             if not body:
                 return match.group(0)
@@ -351,7 +388,7 @@ def expand_one_level(function_body: str, code_str: str, class_name: Optional[str
             expanded = "\n".join(f"{base_indent}{indent_unit}{part}" for part in body.splitlines())
             return f"\n{base_indent}[\n{expanded}\n{base_indent}]\n{base_indent}"
 
-        updated.append(re.sub(r"\b(_\w+)\s*\(.*?\)", inline_replace, line))
+        updated.append(re.sub(inline_call, inline_replace, line))
 
     return "\n".join(updated)
 

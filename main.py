@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import time
 from glob import glob
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -9,7 +10,7 @@ import pandas as pd
 import win32com.client
 
 from BuildOptionReaper import filter_code_by_build_options
-from CallerExtractor import resolve_caller_function
+from CallerExtractor import build_caller_index, resolve_caller_function
 from FunctionBodyExtractor import get_function_body
 
 
@@ -32,6 +33,9 @@ LOG_SKIP = os.path.join(LOG_FOLDER, "log_skipped_entries.txt")
 LOG_SYSTEM = os.path.join(LOG_FOLDER, "log_system_errors.txt")
 
 RAW_SHEET_NAME = "Unit_Interface"
+TARGET_BODY_EXPAND_DEPTH = 2
+CALLER_BODY_EXPAND_DEPTH = 1
+ROW_PROGRESS_EVERY = 1
 
 
 # =========================
@@ -279,7 +283,7 @@ class SWE2FunctionIndex:
             if not text:
                 continue
 
-            for match in re.finditer(r"has\s*parents\s*:\s*([^\n\r;]+)", text, flags=re.IGNORECASE):
+            for match in re.finditer(r"has\s*parent(?:s)?\s*:\s*([^\n\r;]+)", text, flags=re.IGNORECASE):
                 for parent_id in re.findall(r"[A-Za-z][A-Za-z0-9-]*-\d+", match.group(1)):
                     component = self.sources_map.get(parent_id.upper())
                     if component:
@@ -329,6 +333,9 @@ class ProjectContext:
         self.raw_excel_cache: Dict[str, pd.DataFrame] = {}
         self.filtered_file_cache: Dict[str, str] = {}
         self.unit_bundle_cache: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
+        self.unit_code_text_cache: Dict[Tuple[str, str], str] = {}
+        self.caller_index_cache: Dict[Tuple[str, str], dict] = {}
+        self.interface_pairs_cache: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
         self.function_body_cache: Dict[Tuple[str, str, str], str] = {}
 
     def load_component_raw_df(self, component: str) -> pd.DataFrame:
@@ -381,6 +388,50 @@ class ProjectContext:
         self.unit_bundle_cache[cache_key] = bundle
         return bundle
 
+    def unit_code_text(self, component: str, unit: str) -> str:
+        if not hasattr(self, "unit_code_text_cache"):
+            self.unit_code_text_cache = {}
+        cache_key = (normalize_key(component), normalize_key(unit))
+        if cache_key not in self.unit_code_text_cache:
+            bundle = self.unit_code_bundle(component, unit)
+            self.unit_code_text_cache[cache_key] = "\n\n".join(code for _, code in bundle)
+        return self.unit_code_text_cache[cache_key]
+
+    def caller_index(self, component: str, unit: str) -> dict:
+        if not hasattr(self, "caller_index_cache"):
+            self.caller_index_cache = {}
+        cache_key = (normalize_key(component), normalize_key(unit))
+        if cache_key not in self.caller_index_cache:
+            self.caller_index_cache[cache_key] = build_caller_index(self.unit_code_text(component, unit))
+        return self.caller_index_cache[cache_key]
+
+    def interface_pairs_for_unit(self, component: str, unit: str) -> List[Tuple[str, str]]:
+        if not hasattr(self, "interface_pairs_cache"):
+            self.interface_pairs_cache = {}
+        cache_key = (normalize_key(component), normalize_key(unit))
+        if cache_key in self.interface_pairs_cache:
+            return self.interface_pairs_cache[cache_key]
+
+        caller_df = self.load_component_raw_df(component)
+        interface_id_col = choose_column(caller_df, ["Interface ID"], ["interfaceid"])
+        function_name_col = choose_column(caller_df, ["Interface Name"], ["interfacename", "functionname"])
+
+        interface_pairs: List[Tuple[str, str]] = []
+        for _, row in caller_df.iterrows():
+            interface_id = clean_text(row.get(interface_id_col))
+            function_name = clean_text(row.get(function_name_col))
+            if not interface_id or not function_name:
+                continue
+
+            row_unit = parse_interface_id(interface_id, component)
+            if normalize_key(row_unit) != normalize_key(unit):
+                continue
+
+            interface_pairs.append((interface_id, function_name))
+
+        self.interface_pairs_cache[cache_key] = interface_pairs
+        return interface_pairs
+
     def find_function_body(self, component: str, unit: str, function_name: str) -> str:
         cache_key = (normalize_key(component), normalize_key(unit), normalize_space(function_name))
         if cache_key in self.function_body_cache:
@@ -392,16 +443,26 @@ class ProjectContext:
         body = ""
         for _, code in bundle:
             for class_name in search_classes:
-                body = get_function_body(code, function_name, class_name=class_name)
+                body = get_function_body(
+                    code,
+                    function_name,
+                    class_name=class_name,
+                    max_depth=TARGET_BODY_EXPAND_DEPTH,
+                )
                 if body:
                     break
             if body:
                 break
 
         if not body and bundle:
-            combined = "\n\n".join(code for _, code in bundle)
+            combined = self.unit_code_text(component, unit)
             for class_name in search_classes:
-                body = get_function_body(combined, function_name, class_name=class_name)
+                body = get_function_body(
+                    combined,
+                    function_name,
+                    class_name=class_name,
+                    max_depth=TARGET_BODY_EXPAND_DEPTH,
+                )
                 if body:
                     break
 
@@ -422,31 +483,20 @@ class ProjectContext:
             }
 
         caller_component, caller_unit = caller_location
-        caller_df = self.load_component_raw_df(caller_component)
-        interface_id_col = choose_column(caller_df, ["Interface ID"], ["interfaceid"])
-        function_name_col = choose_column(caller_df, ["Interface Name"], ["interfacename", "functionname"])
+        interface_pairs = self.interface_pairs_for_unit(caller_component, caller_unit)
 
-        interface_pairs = []
-        for _, row in caller_df.iterrows():
-            interface_id = clean_text(row.get(interface_id_col))
-            function_name = clean_text(row.get(function_name_col))
-            if not interface_id or not function_name:
-                continue
-
-            row_unit = parse_interface_id(interface_id, caller_component)
-            if normalize_key(row_unit) != normalize_key(caller_unit):
-                continue
-
-            interface_pairs.append((interface_id, function_name))
-
-        bundle = self.unit_code_bundle(caller_component, caller_unit)
-        caller_code = "\n\n".join(code for _, code in bundle)
+        caller_code = self.unit_code_text(caller_component, caller_unit)
+        caller_index = self.caller_index(caller_component, caller_unit)
 
         resolution = resolve_caller_function(
             caller_code,
             target_function_name=target_function,
             interface_pairs=interface_pairs,
             class_name=caller_unit,
+            body_expand_depth=CALLER_BODY_EXPAND_DEPTH,
+            caller_index=caller_index,
+            max_caller_depth=6,
+            max_nodes=5000,
         )
 
         resolution.update(
@@ -493,10 +543,14 @@ def main() -> None:
         swe2_index = SWE2FunctionIndex(SWE2_WORKITEM, sources_map, excel_app=excel_app)
         context = ProjectContext(code_path_map, swe2_index, excel_app)
 
-        for xls_file in raw_excel_files:
+        for file_idx, xls_file in enumerate(raw_excel_files, 1):
             component = extract_component_from_excel_name(xls_file)
 
             try:
+                print(
+                    f"[{file_idx}/{len(raw_excel_files)}] START component={component} file={xls_file}",
+                    flush=True,
+                )
                 df = load_sheet_dataframe(xls_file, preferred_sheet=RAW_SHEET_NAME, excel_app=excel_app)
                 interface_id_col = choose_column(df, ["Interface ID"], ["interfaceid"])
                 function_name_col = choose_column(df, ["Interface Name"], ["interfacename", "functionname"])
@@ -506,8 +560,9 @@ def main() -> None:
                     ["sourcedestination", "source", "destination"],
                     required=False,
                 )
+                total_rows = len(df)
 
-                for _, row in df.iterrows():
+                for row_idx, (_, row) in enumerate(df.iterrows(), 1):
                     interface_id = clean_text(row.get(interface_id_col))
                     function_name = clean_text(row.get(function_name_col))
                     if not interface_id or not function_name:
@@ -518,24 +573,30 @@ def main() -> None:
                     try:
                         source_destination = row.get(source_destination_col) if source_destination_col else None
 
+                        t0 = time.perf_counter()
                         caller_info = context.resolve_caller(component, function_name, source_destination)
+                        caller_ms = (time.perf_counter() - t0) * 1000
                         if caller_info["skip_entry"]:
                             log_skip.append(
                                 f"[INTERNAL ONLY] {component}/{unit}/{function_name}: {caller_info['reason']}"
                             )
                             continue
 
+                        t1 = time.perf_counter()
                         target_body = context.find_function_body(component, unit, function_name)
+                        target_ms = (time.perf_counter() - t1) * 1000
                         if not target_body:
                             log_target_body.append(
                                 f"[NOT FOUND] {component}/{unit}/{function_name}: target function body not found."
                             )
 
+                        t2 = time.perf_counter()
                         target_function_id, workitem_errors = swe2_index.lookup_function_id(
                             component,
                             unit,
                             function_name,
                         )
+                        lookup_ms = (time.perf_counter() - t2) * 1000
                         for error_type, reason in workitem_errors:
                             log_workitem.append(
                                 f"[{error_type}] {component}/{unit}/{function_name}: {reason}"
@@ -566,13 +627,28 @@ def main() -> None:
                             }
                         )
 
+                        if row_idx % ROW_PROGRESS_EVERY == 0:
+                            print(
+                                f"  - {component}: {row_idx}/{total_rows} "
+                                f"(caller={caller_ms:.1f}ms, target={target_ms:.1f}ms, lookup={lookup_ms:.1f}ms)",
+                                flush=True,
+                            )
+
                     except Exception as exc:
                         log_system.append(
                             f"[ROW] Error while processing {component}/{unit}/{function_name}: {exc}"
                         )
 
+                print(
+                    f"[{file_idx}/{len(raw_excel_files)}] END component={component} rows={total_rows}",
+                    flush=True,
+                )
             except Exception as exc:
                 log_system.append(f"[SYSTEM] Error while processing {xls_file}: {exc}")
+                print(
+                    f"[{file_idx}/{len(raw_excel_files)}] FAIL component={component}: {exc}",
+                    flush=True,
+                )
 
     finally:
         excel_app.Quit()
