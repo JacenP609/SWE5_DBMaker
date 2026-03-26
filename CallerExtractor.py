@@ -9,17 +9,27 @@ from FunctionBodyExtractor import (
     mask_comments_and_strings,
 )
 
+_NON_CALL_NAMES = {
+    "if",
+    "for",
+    "while",
+    "switch",
+    "catch",
+    "else",
+    "do",
+    "try",
+    "return",
+    "sizeof",
+}
+
+_CALL_FINDER = re.compile(
+    r"(?<![\w:])(?:[A-Za-z_]\w*::)*([A-Za-z_]\w*)\s*(?:<[^;{}()]*>)?\s*\(",
+    flags=re.MULTILINE,
+)
+
 
 def _normalize_function_name(name: str) -> str:
     return str(name or "").strip().split("::")[-1]
-
-
-def _build_call_pattern(callee_name: str) -> re.Pattern[str]:
-    bare_name = re.escape(_normalize_function_name(callee_name))
-    return re.compile(
-        rf"(?<![\w:])(?:[A-Za-z_]\w*::)*{bare_name}\s*(?:<[^;{{}}()]*>)?\s*\(",
-        flags=re.MULTILINE,
-    )
 
 
 def _candidate_pairs(
@@ -48,12 +58,57 @@ def _candidate_pairs(
     return pairs
 
 
+def build_caller_index(code_str: str) -> dict:
+    definitions = []
+    defined_names = set()
+    for definition in iter_function_definitions(code_str):
+        inner_body = extract_inner_body(definition.body)
+        normalized = _normalize_function_name(definition.name)
+        defined_names.add(normalized)
+        definitions.append(
+            {
+                "name": definition.name,
+                "normalized_name": normalized,
+                "body": definition.body,
+                "masked_inner_body": mask_comments_and_strings(inner_body),
+            }
+        )
+
+    reverse_calls = {}
+    body_by_name = {}
+
+    for definition in definitions:
+        caller = definition["normalized_name"]
+        body_by_name.setdefault(caller, definition["body"])
+
+        seen_callees = set()
+        for match in _CALL_FINDER.finditer(definition["masked_inner_body"]):
+            callee = _normalize_function_name(match.group(1))
+            if not callee or callee in _NON_CALL_NAMES:
+                continue
+            if callee not in defined_names:
+                continue
+            if callee in seen_callees:
+                continue
+            seen_callees.add(callee)
+            reverse_calls.setdefault(callee, []).append(caller)
+
+    return {
+        "definitions": definitions,
+        "reverse_calls": reverse_calls,
+        "body_by_name": body_by_name,
+    }
+
+
 def resolve_caller_function(
     code_str: str,
     target_function_name: str,
     interface_pairs: Iterable[Tuple[str, str]] | Iterable[Mapping[str, str]],
     class_name: str | None = None,
-    max_depth: int = 8,
+    body_expand_depth: int = 1,
+    caller_index: dict | None = None,
+    max_caller_depth: int = 6,
+    max_nodes: int = 5000,
 ) -> dict:
     candidates = _candidate_pairs(interface_pairs)
     if not code_str or not target_function_name or not candidates:
@@ -67,42 +122,40 @@ def resolve_caller_function(
     for pair in candidates:
         interface_index.setdefault(pair["normalized_name"], []).append(pair)
 
-    definitions = []
-    for definition in iter_function_definitions(code_str):
-        inner_body = extract_inner_body(definition.body)
-        definitions.append(
-            {
-                "name": definition.name,
-                "body": definition.body,
-                "masked_inner_body": mask_comments_and_strings(inner_body),
-            }
-        )
+    index = caller_index or build_caller_index(code_str)
+    reverse_calls = index.get("reverse_calls", {})
+    body_by_name = index.get("body_by_name", {})
 
-    queue = deque([_normalize_function_name(target_function_name)])
+    queue = deque([(_normalize_function_name(target_function_name), 0)])
     visited = set()
+    queued = {_normalize_function_name(target_function_name)}
+    nodes = 0
 
     while queue:
-        callee_name = queue.popleft()
+        callee_name, depth = queue.popleft()
+        queued.discard(callee_name)
         if callee_name in visited:
             continue
         visited.add(callee_name)
 
-        pattern = _build_call_pattern(callee_name)
+        nodes += 1
+        if nodes > max_nodes:
+            break
 
-        for definition in definitions:
-            if not pattern.search(definition["masked_inner_body"]):
-                continue
-
-            caller_name = definition["name"]
-            normalized_caller = _normalize_function_name(caller_name)
+        for normalized_caller in reverse_calls.get(callee_name, []):
+            caller_name = normalized_caller
 
             if normalized_caller in interface_index:
                 pair = interface_index[normalized_caller][0]
-                expanded_body = (
-                    get_function_body(code_str, pair["function_name"], class_name, max_depth)
-                    or get_function_body(code_str, caller_name, class_name, max_depth)
-                    or definition["body"]
-                )
+                base_body = body_by_name.get(normalized_caller, "")
+                if body_expand_depth <= 0:
+                    expanded_body = base_body
+                else:
+                    expanded_body = (
+                        get_function_body(code_str, pair["function_name"], class_name, body_expand_depth)
+                        or get_function_body(code_str, caller_name, class_name, body_expand_depth)
+                        or base_body
+                    )
 
                 return {
                     "caller_function_id": pair["interface_id"],
@@ -110,7 +163,13 @@ def resolve_caller_function(
                     "caller_function_body": expanded_body,
                 }
 
-            queue.append(normalized_caller)
+            if (
+                depth < max_caller_depth
+                and normalized_caller not in visited
+                and normalized_caller not in queued
+            ):
+                queue.append((normalized_caller, depth + 1))
+                queued.add(normalized_caller)
 
     return {
         "caller_function_id": "",
