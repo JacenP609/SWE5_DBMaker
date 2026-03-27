@@ -1,4 +1,4 @@
-# SWE5 DBMaker (시나리오 중심 설명)
+# SWE5 DBMaker
 
 이 스크립트는 **SWE.5 데이터 생성**을 위해, 각 Target Function에 대해 아래 정보를 만듭니다.
 
@@ -16,8 +16,8 @@
 
 예시 Entry:
 
-- Target: `ActivePeriodPowerManagement/APPM/Initialize`
-- Source/Destination: `CoreInitialize/GlobalObjects`
+- Target: `Component/UNIT/Initialize`
+- Source/Destination: `CoreComponent/CoreUnit`
 
 처리 흐름은 아래와 같습니다.
 
@@ -52,7 +52,7 @@
 
 ## 입력
 
-- AM9C1 Source Code
+- FW Source Code
 - `RAW_FOLDER` 내 Component별 Raw Excel
 - `code_path_map.json` (component/unit -> code path)
 - `build_options.json` (Build option 필터링)
