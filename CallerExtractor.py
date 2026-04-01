@@ -60,11 +60,9 @@ def _candidate_pairs(
 
 def build_caller_index(code_str: str) -> dict:
     definitions = []
-    defined_names = set()
     for definition in iter_function_definitions(code_str):
         inner_body = extract_inner_body(definition.body)
         normalized = _normalize_function_name(definition.name)
-        defined_names.add(normalized)
         definitions.append(
             {
                 "name": definition.name,
@@ -85,8 +83,6 @@ def build_caller_index(code_str: str) -> dict:
         for match in _CALL_FINDER.finditer(definition["masked_inner_body"]):
             callee = _normalize_function_name(match.group(1))
             if not callee or callee in _NON_CALL_NAMES:
-                continue
-            if callee not in defined_names:
                 continue
             if callee in seen_callees:
                 continue
