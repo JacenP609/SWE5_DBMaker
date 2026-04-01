@@ -9,9 +9,14 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import pandas as pd
 import win32com.client
 
-from BuildOptionReaper import filter_code_by_build_options
+from BuildOptionReaper import (
+    diagnose_call_reap_out,
+    filter_code_by_build_options,
+    is_special_option_for_else_resolve,
+)
 from CallerExtractor import build_caller_index, resolve_caller_function
 from FunctionBodyExtractor import get_function_body
+from Suspect_Interface import create_suspect_entry, export_suspect_interfaces
 
 
 # =========================
@@ -31,6 +36,7 @@ LOG_CALLER = os.path.join(LOG_FOLDER, "log_caller_resolution.txt")
 LOG_WORKITEM = os.path.join(LOG_FOLDER, "log_swe2_lookup.txt")
 LOG_SKIP = os.path.join(LOG_FOLDER, "log_skipped_entries.txt")
 LOG_SYSTEM = os.path.join(LOG_FOLDER, "log_system_errors.txt")
+LOG_SUSPECT_INTERFACE = os.path.join(LOG_FOLDER, "SWE2_Suspect_Interface.xlsx")
 
 RAW_SHEET_NAME = "Unit_Interface"
 TARGET_BODY_EXPAND_DEPTH = 2
@@ -194,15 +200,24 @@ def parse_source_destination(value) -> List[Tuple[str, str]]:
     return entries
 
 
-def first_external_caller(
+def external_callers(
     source_destination,
     target_component: str,
-) -> Optional[Tuple[str, str]]:
+) -> List[Tuple[str, str]]:
     target_key = normalize_component(target_component)
+    callers: List[Tuple[str, str]] = []
     for component, unit in parse_source_destination(source_destination):
         if normalize_component(component) != target_key:
-            return component, unit
-    return None
+            callers.append((component, unit))
+    return callers
+
+
+def _contains_function_call(code_text: str, function_name: str) -> bool:
+    target = re.escape(clean_text(function_name).split("::")[-1])
+    if not target:
+        return False
+    pattern = re.compile(rf"(?<![\w:])(?:[A-Za-z_]\w*::)*{target}\s*(?:<[^;{{}}()]*>)?\s*\(")
+    return bool(pattern.search(code_text))
 
 
 def discover_raw_excel_files() -> List[str]:
@@ -283,7 +298,11 @@ class SWE2FunctionIndex:
             if not text:
                 continue
 
-            for match in re.finditer(r"has\s*parent(?:s)?\s*:\s*([^\n\r;]+)", text, flags=re.IGNORECASE):
+            for match in re.finditer(
+                r"is\s*derived\s*from\s*:\s*([^\n\r;]+)",
+                text,
+                flags=re.IGNORECASE,
+            ):
                 for parent_id in re.findall(r"[A-Za-z][A-Za-z0-9-]*-\d+", match.group(1)):
                     component = self.sources_map.get(parent_id.upper())
                     if component:
@@ -332,11 +351,13 @@ class ProjectContext:
         self.excel_app = excel_app
         self.raw_excel_cache: Dict[str, pd.DataFrame] = {}
         self.filtered_file_cache: Dict[str, str] = {}
+        self.filtered_file_cache_fallback: Dict[str, str] = {}
         self.unit_bundle_cache: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
         self.unit_code_text_cache: Dict[Tuple[str, str], str] = {}
         self.caller_index_cache: Dict[Tuple[str, str], dict] = {}
         self.interface_pairs_cache: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
         self.function_body_cache: Dict[Tuple[str, str, str], str] = {}
+        self.raw_code_cache: Dict[str, str] = {}
 
     def load_component_raw_df(self, component: str) -> pd.DataFrame:
         cache_key = normalize_space(component)
@@ -369,6 +390,21 @@ class ProjectContext:
             with open(file_path, "r", encoding="utf-8", errors="ignore") as file:
                 self.filtered_file_cache[file_path] = filter_code_by_build_options(file.read())
         return self.filtered_file_cache[file_path]
+
+    def _read_filtered_code_else_fallback(self, file_path: str) -> str:
+        if file_path not in self.filtered_file_cache_fallback:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as file:
+                self.filtered_file_cache_fallback[file_path] = filter_code_by_build_options(
+                    file.read(),
+                    prefer_special_if=False,
+                )
+        return self.filtered_file_cache_fallback[file_path]
+
+    def _read_raw_code(self, file_path: str) -> str:
+        if file_path not in self.raw_code_cache:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as file:
+                self.raw_code_cache[file_path] = file.read()
+        return self.raw_code_cache[file_path]
 
     def unit_code_bundle(self, component: str, unit: str) -> List[Tuple[str, str]]:
         cache_key = (normalize_key(component), normalize_key(unit))
@@ -470,8 +506,8 @@ class ProjectContext:
         return body
 
     def resolve_caller(self, target_component: str, target_function: str, source_destination) -> dict:
-        caller_location = first_external_caller(source_destination, target_component)
-        if not caller_location:
+        caller_locations = external_callers(source_destination, target_component)
+        if not caller_locations:
             return {
                 "skip_entry": True,
                 "reason": "All caller units belong to the same component.",
@@ -482,32 +518,139 @@ class ProjectContext:
                 "caller_function_body": "",
             }
 
-        caller_component, caller_unit = caller_location
-        interface_pairs = self.interface_pairs_for_unit(caller_component, caller_unit)
+        first_component, first_unit = caller_locations[0]
+        fallback = {
+            "skip_entry": False,
+            "reason": "No caller function matched any source/destination unit.",
+            "caller_component": first_component,
+            "caller_unit": first_unit,
+            "caller_function_id": "",
+            "caller_function_name": "",
+            "caller_function_body": "",
+        }
+        diagnostics: List[str] = []
 
-        caller_code = self.unit_code_text(caller_component, caller_unit)
-        caller_index = self.caller_index(caller_component, caller_unit)
+        for caller_component, caller_unit in caller_locations:
+            path_hints = self._resolve_unit_paths(caller_component, caller_unit)
+            if not path_hints:
+                diagnostics.append(f"{caller_component}/{caller_unit}=code path map miss")
+                continue
 
-        resolution = resolve_caller_function(
-            caller_code,
-            target_function_name=target_function,
-            interface_pairs=interface_pairs,
-            class_name=caller_unit,
-            body_expand_depth=CALLER_BODY_EXPAND_DEPTH,
-            caller_index=caller_index,
-            max_caller_depth=6,
-            max_nodes=5000,
-        )
+            raw_bundle = []
+            for path_hint in path_hints:
+                for candidate in candidate_code_files(path_hint):
+                    if os.path.exists(candidate):
+                        raw_bundle.append((candidate, self._read_raw_code(candidate)))
 
-        resolution.update(
-            {
-                "skip_entry": False,
-                "reason": "",
-                "caller_component": caller_component,
-                "caller_unit": caller_unit,
-            }
-        )
-        return resolution
+            if not raw_bundle:
+                diagnostics.append(f"{caller_component}/{caller_unit}=code file missing from path map")
+                continue
+
+            interface_pairs = self.interface_pairs_for_unit(caller_component, caller_unit)
+            caller_code = self.unit_code_text(caller_component, caller_unit)
+            caller_index = self.caller_index(caller_component, caller_unit)
+
+            if not _contains_function_call(caller_code, target_function):
+                raw_has_call = any(_contains_function_call(raw_code, target_function) for _, raw_code in raw_bundle)
+                if raw_has_call:
+                    fallback_code = "\n\n".join(
+                        self._read_filtered_code_else_fallback(path)
+                        for path, _ in raw_bundle
+                    )
+                    fallback_has_call = _contains_function_call(fallback_code, target_function)
+
+                    options: List[str] = []
+                    conditions: List[str] = []
+                    for _, raw_code in raw_bundle:
+                        diag = diagnose_call_reap_out(raw_code, target_function)
+                        options.extend(diag.get("options", []))
+                        conditions.extend(diag.get("conditions", []))
+
+                    uniq_options = list(dict.fromkeys(options))
+                    uniq_conditions = list(dict.fromkeys(conditions))
+                    should_try_special_else_resolve = fallback_has_call and any(
+                        is_special_option_for_else_resolve(option) for option in uniq_options
+                    )
+
+                    if should_try_special_else_resolve:
+                        fallback_index = build_caller_index(fallback_code)
+                        for class_name in [caller_unit, None]:
+                            resolution = resolve_caller_function(
+                                fallback_code,
+                                target_function_name=target_function,
+                                interface_pairs=interface_pairs,
+                                class_name=class_name,
+                                body_expand_depth=CALLER_BODY_EXPAND_DEPTH,
+                                caller_index=fallback_index,
+                                max_caller_depth=6,
+                                max_nodes=5000,
+                            )
+                            resolution.update(
+                                {
+                                    "skip_entry": False,
+                                    "reason": "resolved via special-option ELSE fallback",
+                                    "caller_component": caller_component,
+                                    "caller_unit": caller_unit,
+                                }
+                            )
+                            if resolution["caller_function_id"]:
+                                return resolution
+
+                    option_hint = f" (build option: {', '.join(uniq_options)})" if uniq_options else ""
+                    condition_hint = (
+                        f" [condition: {' | '.join(uniq_conditions[:2])}]"
+                        if uniq_conditions
+                        else ""
+                    )
+                    fallback_hint = " [else-fallback has call]" if fallback_has_call else ""
+                    diagnostics.append(
+                        f"{caller_component}/{caller_unit}=call removed by BuildOptionReaper"
+                        f"{option_hint}{condition_hint}{fallback_hint}"
+                    )
+                else:
+                    diagnostics.append(f"{caller_component}/{caller_unit}=no call to target function")
+                continue
+
+            class_candidates = [caller_unit, None]
+            resolved = False
+            for class_name in class_candidates:
+                resolution = resolve_caller_function(
+                    caller_code,
+                    target_function_name=target_function,
+                    interface_pairs=interface_pairs,
+                    class_name=class_name,
+                    body_expand_depth=CALLER_BODY_EXPAND_DEPTH,
+                    caller_index=caller_index,
+                    max_caller_depth=6,
+                    max_nodes=5000,
+                )
+
+                resolution.update(
+                    {
+                        "skip_entry": False,
+                        "reason": "",
+                        "caller_component": caller_component,
+                        "caller_unit": caller_unit,
+                    }
+                )
+
+                if resolution["caller_function_id"]:
+                    resolved = True
+                    return resolution
+
+            if not resolved:
+                if interface_pairs:
+                    diagnostics.append(
+                        f"{caller_component}/{caller_unit}=call chain exists but no interface-exposed caller"
+                    )
+                else:
+                    diagnostics.append(
+                        f"{caller_component}/{caller_unit}=caller interface list empty"
+                    )
+
+        if diagnostics:
+            fallback["reason"] = "; ".join(diagnostics)
+        return fallback
 
 
 def save_log(path: str, entries: List[str]) -> bool:
@@ -537,6 +680,7 @@ def main() -> None:
     log_workitem: List[str] = []
     log_skip: List[str] = []
     log_system: List[str] = []
+    suspect_rows: List[dict] = []
     all_rows: List[dict] = []
 
     try:
@@ -606,7 +750,15 @@ def main() -> None:
                             log_caller.append(
                                 f"[NOT FOUND] {component}/{unit}/{function_name}: "
                                 f"caller resolution failed for {caller_info['caller_component']}/"
-                                f"{caller_info['caller_unit']}."
+                                f"{caller_info['caller_unit']}. reason={caller_info['reason']}"
+                            )
+                            suspect_rows.append(
+                                create_suspect_entry(
+                                    component=component,
+                                    unit=unit,
+                                    function_name=function_name,
+                                    reason=caller_info["reason"],
+                                )
                             )
 
                         if caller_info["caller_function_id"] and not caller_info["caller_function_body"]:
@@ -680,6 +832,7 @@ def main() -> None:
         save_log(LOG_SKIP, log_skip),
         save_log(LOG_SYSTEM, log_system),
     ]
+    export_suspect_interfaces(LOG_SUSPECT_INTERFACE, suspect_rows)
 
     if any(written_logs):
         print("[INFO] Processing completed with logs. Check the log folder for details.")
